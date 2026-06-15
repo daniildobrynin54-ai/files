@@ -53,6 +53,7 @@ TIME_STEP_MINUTES = 30
 
 TRIGGER_BOOK = "бронь"
 TRIGGER_SCHEDULE = "брони"
+TRIGGER_SCHEDULE_TOMORROW = "брони завтра"
 TRIGGER_MY_BOOKINGS = "мои брони"
 TRIGGER_CANCEL = ("отмена брони", "отмена броней")
 TRIGGER_ID = "id"
@@ -438,6 +439,11 @@ async def show_today_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_schedule_image(update, update.effective_chat.id, date_to_str(today), date_to_human(today))
 
 
+async def show_tomorrow_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tomorrow = today_date() + timedelta(days=1)
+    await send_schedule_image(update, update.effective_chat.id, date_to_str(tomorrow), date_to_human(tomorrow))
+
+
 async def show_my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db_connect()
     try:
@@ -782,6 +788,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Выбери дату для бронирования:",
                 reply_markup=build_date_keyboard(update.effective_user.id),
             )
+        return
+
+    if lower == TRIGGER_SCHEDULE_TOMORROW:
+        await show_tomorrow_schedule(update, context)
         return
 
     if lower == TRIGGER_SCHEDULE:
