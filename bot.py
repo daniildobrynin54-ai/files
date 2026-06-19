@@ -4,15 +4,25 @@ Telegram-бот для бронирования временных слотов 
 Бот реагирует ТОЛЬКО на слова-триггеры (точное совпадение текста сообщения,
 без команд со слешем):
 
-  бронь                — создать бронь (выбор даты/времени через кнопки)
-  бронь HH:MM-HH:MM    — забронировать время сразу
+  бронь                — создать бронь (выбор даты: сегодня/завтра/послезавтра,
+                          затем времени через кнопки)
+  бронь HH:MM-HH:MM    — забронировать время сразу (на сегодня)
   брони                — показать расписание (все брони) на сегодня картинкой
+  брони завтра         — показать расписание на завтра картинкой
   мои брони            — список своих бронирований на сегодня
-  отмена брони         — показать свои брони с кнопками отмены
+  отмена брони         — выбор даты (сегодня/завтра/послезавтра), затем список
+                          своих броней на эту дату с кнопками отмены
   отмена броней        — то же самое
-  отмена HH:MM-HH:MM   — отменить конкретную свою бронь
+  отмена HH:MM-HH:MM   — отменить конкретную свою бронь на сегодня
   ник <имя>            — задать свой ник
   id                   — показать chat_id и message_thread_id текущей темы
+
+Правила длительности брони:
+  • с 8:00 до 24:00 — от 30 до 120 минут;
+  • с 00:00 до 8:00 (ночь) — без ограничения сверху, но строго больше часа.
+
+Не больше 2 бронирований на один день на одного человека.
+Бронировать и отменять брони можно на сегодня, завтра и послезавтра.
 
 Запуск: см. README.md
 """
@@ -48,8 +58,48 @@ DB_PATH = os.environ.get("BOT_DB_PATH", "bookings.db")
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "-1002234810541"))
 ALLOWED_THREAD_ID = os.environ.get("ALLOWED_THREAD_ID")
 ALLOWED_THREAD_ID = int(ALLOWED_THREAD_ID) if ALLOWED_THREAD_ID else None
-MIN_DURATION_MINUTES = 60
 TIME_STEP_MINUTES = 30
+
+# Дневное окно: с 8:00 до 24:00 — длительность брони от 30 до 120 минут.
+DAY_START_MIN = 8 * 60          # 480  (08:00)
+DAY_END_MIN = 24 * 60           # 1440 (24:00)
+DAY_MIN_DURATION = 30
+DAY_MAX_DURATION = 120
+
+# Ночное окно: с 00:00 до 8:00 — без ограничения сверху, но больше часа за раз.
+NIGHT_MIN_DURATION = 61         # строго больше 60 минут
+NIGHT_MAX_DURATION = None       # без ограничения
+
+# Максимум бронирований на один день для одного человека.
+MAX_BOOKINGS_PER_DAY = 2
+
+
+def is_night_start(start_min: int) -> bool:
+    return start_min < DAY_START_MIN
+
+
+def min_duration_for_start(start_min: int) -> int:
+    return NIGHT_MIN_DURATION if is_night_start(start_min) else DAY_MIN_DURATION
+
+
+def max_duration_for_start(start_min: int):
+    return NIGHT_MAX_DURATION if is_night_start(start_min) else DAY_MAX_DURATION
+
+
+def validate_duration(start_min: int, end_min: int):
+    """Возвращает (ok: bool, error_message: str | None)."""
+    duration = end_min - start_min
+    if is_night_start(start_min):
+        if duration <= NIGHT_MIN_DURATION - 1:
+            return False, "Ночью (до 8:00) длительность брони должна быть больше 60 минут."
+        return True, None
+    else:
+        if duration < DAY_MIN_DURATION or duration > DAY_MAX_DURATION:
+            return False, (
+                f"С 8:00 до 24:00 длительность брони — от {DAY_MIN_DURATION} "
+                f"до {DAY_MAX_DURATION} минут."
+            )
+        return True, None
 
 TRIGGER_BOOK = "бронь"
 TRIGGER_SCHEDULE = "брони"
@@ -205,6 +255,14 @@ def cancel_booking(conn, chat_id, booking_date, start_min, end_min, user_id) -> 
     return cur.rowcount > 0
 
 
+def count_user_bookings_on_date(conn, chat_id, booking_date, user_id) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM bookings WHERE chat_id=? AND booking_date=? AND user_id=?",
+        (chat_id, booking_date, user_id),
+    ).fetchone()
+    return row[0] if row else 0
+
+
 def cancel_all_bookings(conn, chat_id, booking_date, user_id) -> int:
     cur = conn.execute(
         "DELETE FROM bookings WHERE chat_id=? AND booking_date=? AND user_id=?",
@@ -218,9 +276,10 @@ def available_start_times(conn, chat_id, booking_date):
     bookings = get_schedule(conn, chat_id, booking_date)
     starts = []
     for t in range(0, 1440, TIME_STEP_MINUTES):
-        if t + MIN_DURATION_MINUTES > 1440:
+        min_dur = min_duration_for_start(t)
+        if t + min_dur > 1440:
             continue
-        conflict = any(t < e and (t + MIN_DURATION_MINUTES) > s for s, e, _ in bookings)
+        conflict = any(t < e and (t + min_dur) > s for s, e, _ in bookings)
         if not conflict:
             starts.append(t)
     return starts
@@ -232,8 +291,20 @@ def available_end_times(conn, chat_id, booking_date, start_min):
     for s, e, _ in bookings:
         if s > start_min and s < cap:
             cap = s
+
+    max_dur = max_duration_for_start(start_min)
+    if max_dur is not None:
+        cap = min(cap, start_min + max_dur)
+
+    min_dur = min_duration_for_start(start_min)
+    # Первый допустимый конец, выровненный по шагу сетки, но не меньше минимальной длительности.
+    first_end = start_min + min_dur
+    remainder = (first_end - start_min) % TIME_STEP_MINUTES
+    if remainder != 0:
+        first_end += TIME_STEP_MINUTES - remainder
+
     ends = []
-    t = start_min + MIN_DURATION_MINUTES
+    t = first_end
     while t <= cap:
         ends.append(t)
         t += TIME_STEP_MINUTES
@@ -336,13 +407,17 @@ async def send_schedule_image(update: Update, chat_id: int, booking_date: str, h
 
 # ====================== КНОПКИ ДЛЯ БРОНИРОВАНИЯ ======================
 
-def build_date_keyboard(user_id: int):
+def build_date_keyboard(user_id: int, prefix: str = "bd", cancel_data: str | None = None):
     today = today_date()
     tomorrow = today + timedelta(days=1)
+    after_tomorrow = today + timedelta(days=2)
+    if cancel_data is None:
+        cancel_data = f"bcancel:{user_id}"
     kb = [
-        [InlineKeyboardButton(f"📅 Сегодня, {date_to_human(today)}", callback_data=f"bd:{user_id}:{date_to_str(today)}")],
-        [InlineKeyboardButton(f"📅 Завтра, {date_to_human(tomorrow)}", callback_data=f"bd:{user_id}:{date_to_str(tomorrow)}")],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f"bcancel:{user_id}")],
+        [InlineKeyboardButton(f"📅 Сегодня, {date_to_human(today)}", callback_data=f"{prefix}:{user_id}:{date_to_str(today)}")],
+        [InlineKeyboardButton(f"📅 Завтра, {date_to_human(tomorrow)}", callback_data=f"{prefix}:{user_id}:{date_to_str(tomorrow)}")],
+        [InlineKeyboardButton(f"📅 Послезавтра, {date_to_human(after_tomorrow)}", callback_data=f"{prefix}:{user_id}:{date_to_str(after_tomorrow)}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=cancel_data)],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -469,28 +544,32 @@ async def show_my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_cancel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список бронирований пользователя с кнопками отмены каждой."""
-    chat_id = update.effective_chat.id
+    """Показывает выбор даты, затем список бронирований пользователя с кнопками отмены."""
     user_id = update.effective_user.id
-    booking_date = date_to_str(today_date())
+    kb = build_date_keyboard(user_id, prefix="cdsel", cancel_data=f"cc:{user_id}")
+    await update.effective_message.reply_text(
+        "За какой день показать твои бронирования для отмены?",
+        reply_markup=kb,
+    )
 
-    conn = db_connect()
-    try:
-        rows = conn.execute(
-            "SELECT start_min, end_min FROM bookings "
-            "WHERE chat_id=? AND booking_date=? AND user_id=? ORDER BY start_min",
-            (chat_id, booking_date, user_id),
-        ).fetchall()
-    finally:
-        conn.close()
+
+async def send_cancel_list_for_date(query, conn, chat_id: int, owner_id: int, booking_date: str):
+    """Выводит (или редактирует существующее сообщение в) список бронирований owner_id на booking_date с кнопками отмены."""
+    rows = conn.execute(
+        "SELECT start_min, end_min FROM bookings "
+        "WHERE chat_id=? AND booking_date=? AND user_id=? ORDER BY start_min",
+        (chat_id, booking_date, owner_id),
+    ).fetchall()
+
+    human = human_date_from_str(booking_date)
 
     if not rows:
-        await update.effective_message.reply_text("У тебя нет бронирований на сегодня.")
+        await query.edit_message_text(f"У тебя нет бронирований на {human}.")
         return
 
-    kb = build_cancel_menu_keyboard(rows, user_id, booking_date)
-    await update.effective_message.reply_text(
-        "🗓 Твои бронирования на сегодня.\nНажми на бронь, чтобы её отменить:",
+    kb = build_cancel_menu_keyboard(rows, owner_id, booking_date)
+    await query.edit_message_text(
+        f"🗓 Твои бронирования на {human}.\nНажми на бронь, чтобы её отменить:",
         reply_markup=kb,
     )
 
@@ -544,14 +623,13 @@ async def try_book_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.effective_message.reply_text("Некорректное время. Используй формат HH:MM, например 14:00.")
         return
 
-    if end_min <= start_min:
+    if end_min - start_min <= 0:
         await update.effective_message.reply_text("Время окончания должно быть позже времени начала.")
         return
 
-    if end_min - start_min < MIN_DURATION_MINUTES:
-        await update.effective_message.reply_text(
-            f"Минимальная длительность брони — {MIN_DURATION_MINUTES} минут."
-        )
+    ok, err = validate_duration(start_min, end_min)
+    if not ok:
+        await update.effective_message.reply_text(err)
         return
 
     chat_id = update.effective_chat.id
@@ -560,6 +638,13 @@ async def try_book_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
 
     conn = db_connect()
     try:
+        existing_count = count_user_bookings_on_date(conn, chat_id, booking_date, user_id)
+        if existing_count >= MAX_BOOKINGS_PER_DAY:
+            await update.effective_message.reply_text(
+                f"🚫 У тебя уже {MAX_BOOKINGS_PER_DAY} брони на этот день. Больше нельзя забронировать в этот день."
+            )
+            return
+
         overlap = find_overlap(conn, chat_id, booking_date, start_min, end_min)
         if overlap:
             o_start, o_end, o_nick = overlap
@@ -632,7 +717,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"На {human} свободных слотов нет 😔", reply_markup=back_kb)
                 return
             await query.edit_message_text(
-                f"Дата: {human}\nВыбери время начала брони (мин. длительность {MIN_DURATION_MINUTES} мин):",
+                f"Дата: {human}\nВыбери время начала брони:\n"
+                f"({DAY_MIN_DURATION}-{DAY_MAX_DURATION} мин с 8:00 до 24:00, "
+                f"ночью — более 60 мин, без ограничения сверху)",
                 reply_markup=kb,
             )
 
@@ -659,6 +746,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await wrong_user()
                 return
             start_min, end_min = int(start_s), int(end_s)
+
+            existing_count = count_user_bookings_on_date(conn, chat_id, date_str, owner_id)
+            if existing_count >= MAX_BOOKINGS_PER_DAY:
+                await query.edit_message_text(
+                    f"🚫 У тебя уже {MAX_BOOKINGS_PER_DAY} брони на {human_date_from_str(date_str)}. "
+                    "Больше нельзя забронировать в этот день."
+                )
+                return
 
             overlap = find_overlap(conn, chat_id, date_str, start_min, end_min)
             if overlap:
@@ -704,9 +799,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb, starts = build_start_keyboard(conn, chat_id, date_str, owner_id)
             human = human_date_from_str(date_str)
             await query.edit_message_text(
-                f"Дата: {human}\nВыбери время начала брони (мин. длительность {MIN_DURATION_MINUTES} мин):",
+                f"Дата: {human}\nВыбери время начала брони:\n"
+                f"({DAY_MIN_DURATION}-{DAY_MAX_DURATION} мин с 8:00 до 24:00, "
+                f"ночью — более 60 мин, без ограничения сверху)",
                 reply_markup=kb,
             )
+
+        # ── Выбор даты для отмены бронирований ─────────────────────────────
+        # callback_data формат: cdsel:{user_id}:{booking_date}
+        elif data.startswith("cdsel:"):
+            _, owner_s, booking_date = data.split(":", 2)
+            owner_id = int(owner_s)
+            if caller_id != owner_id:
+                await wrong_user()
+                return
+            await send_cancel_list_for_date(query, conn, chat_id, owner_id, booking_date)
 
         # ── Отмена конкретной брони из меню отмены ────────────────────────
         # callback_data формат: co:{user_id}:{booking_date}:{start_min}:{end_min}
@@ -733,17 +840,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (chat_id, booking_date, owner_id),
             ).fetchall()
 
-            cancelled_text = f"❎ Бронь {minutes_to_time(start_min)} - {minutes_to_time(end_min)} отменена."
+            human = human_date_from_str(booking_date)
+            cancelled_text = f"❎ Бронь {minutes_to_time(start_min)} - {minutes_to_time(end_min)} ({human}) отменена."
 
             if remaining:
                 kb = build_cancel_menu_keyboard(remaining, owner_id, booking_date)
                 await query.edit_message_text(
                     f"{cancelled_text}\n\n"
-                    "🗓 Оставшиеся бронирования на сегодня.\nНажми на бронь, чтобы её отменить:",
+                    f"🗓 Оставшиеся бронирования на {human}.\nНажми на бронь, чтобы её отменить:",
                     reply_markup=kb,
                 )
             else:
-                await query.edit_message_text(f"{cancelled_text}\nБольше бронирований на сегодня нет.")
+                await query.edit_message_text(f"{cancelled_text}\nБольше бронирований на {human} нет.")
 
         # ── Закрыть меню отмены ───────────────────────────────────────────
         # callback_data формат: cc:{user_id}
